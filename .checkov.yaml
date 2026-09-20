@@ -5,3 +5,14 @@ framework:
   - github_actions
 quiet: true
 compact: true
+
+skip-check:
+  # CKV_GHA_7 requires workflow_dispatch inputs to be empty, so that build
+  # output cannot be influenced by a caller. These workflows produce no build
+  # output; their inputs are the safety gates. Destroy takes a typed
+  # confirmation before it will delete anything, and Prove takes the promotion
+  # flag that moves Conditional Access from report-only to enforced. Removing
+  # them to satisfy this check would mean a destructive run with no confirmation
+  # and enforcement with no deliberate act, which is the opposite of what the
+  # rule is protecting against.
+  - CKV_GHA_7
