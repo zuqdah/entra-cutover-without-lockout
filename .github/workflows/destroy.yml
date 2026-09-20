@@ -1,0 +1,85 @@
+name: Destroy
+
+on:
+  schedule:
+    # Nightly, so a lab left running overnight is a bug that fixes itself.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type destroy to confirm.'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  destroy:
+    name: Remove every object this lab created
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - name: Check the confirmation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm != 'destroy' }}
+        run: |
+          echo "Confirmation was '${{ inputs.confirm }}', expected 'destroy'."
+          exit 1
+
+      - uses: actions/checkout@v7
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::${{ secrets.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_CLIENT_ID }}"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Init
+        run: terraform -chdir=infra init -input=false
+
+      - name: Destroy
+        env:
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_domain: ${{ vars.LAB_DOMAIN }}
+        run: terraform -chdir=infra destroy -input=false -auto-approve
+
+      # Terraform reporting success is not the same as the directory being
+      # clean, and a Conditional Access policy left behind in a tenant is the
+      # kind of leftover that locks someone out months later.
+      - name: Confirm the directory is clean
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $policies = az rest --method GET `
+            --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$select=id,displayName' |
+            ConvertFrom-Json
+          $left = @($policies.value | Where-Object { $_.displayName -like 'cutover *' })
+
+          $users = az ad user list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json
+          $groups = az ad group list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json
+
+          Write-Host "policies left: $($left.Count), users left: $(@($users).Count), groups left: $(@($groups).Count)"
+
+          if ($left.Count -or @($users).Count -or @($groups).Count) {
+            $left | ForEach-Object { Write-Host "  policy: $($_.displayName)" }
+            $users | ForEach-Object { Write-Host "  user: $_" }
+            $groups | ForEach-Object { Write-Host "  group: $_" }
+            throw 'The directory still holds objects this lab created.'
+          }
+
+          Write-Host 'The directory is clean.'

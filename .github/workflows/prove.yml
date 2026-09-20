@@ -1,0 +1,115 @@
+name: Prove
+
+# Manual only. This deploys Conditional Access policies into a directory, and
+# nothing about that should happen because a branch moved.
+on:
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: 'Promote the policies from report-only to enforced. Only meaningful once the proof has passed on this exact configuration.'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  prove:
+    name: Deploy report-only and evaluate the matrix
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::${{ secrets.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_CLIENT_ID }}"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Federated credentials, so this workflow holds no secret it could leak
+      # and none that could expire in the middle of an incident.
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Init
+        run: terraform -chdir=infra init -input=false
+
+      - name: Plan
+        env:
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_domain: ${{ vars.LAB_DOMAIN }}
+        run: terraform -chdir=infra plan -input=false -out=tfplan
+
+      - name: Apply
+        env:
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_domain: ${{ vars.LAB_DOMAIN }}
+        run: terraform -chdir=infra apply -input=false -auto-approve tfplan
+
+      - name: Collect outputs
+        id: outputs
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra output -json > outputs.json
+          # jq -e so an output the apply never produced fails here rather than
+          # arriving as an empty string three steps later.
+          jq -e '.identities.value' outputs.json > identities.json
+          jq -e -r '.break_glass_group_id.value' outputs.json > /dev/null
+          echo "collected $(jq -r 'length' identities.json) identities"
+
+      # Entra applies a directory write within seconds and evaluates it against
+      # a cache that trails behind. Proving a policy that has not landed yet
+      # reads as a clean run.
+      - name: Wait for the directory to settle
+        run: sleep 90
+
+      - name: Evaluate the scenario matrix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identities = @{}
+          $raw = [System.IO.File]::ReadAllText('identities.json') | ConvertFrom-Json
+          foreach ($property in $raw.PSObject.Properties) { $identities[$property.Name] = $property.Value }
+
+          $breakGlass = @(
+            (az ad user list --filter "startswith(displayName,'cutover-breakglass')" --query "[].id" -o tsv) -split "`n" |
+              Where-Object { $_ }
+          )
+          if (-not $breakGlass.Count) { throw 'No break-glass accounts were found, so the lockout check cannot run.' }
+
+          ./scripts/Invoke-CutoverProof.ps1 `
+            -TenantId '${{ secrets.AZURE_TENANT_ID }}' `
+            -MatrixPath 'scenario-matrix.json' `
+            -IdentityMap $identities `
+            -BreakGlassId $breakGlass `
+            -ReportPath 'cutover-proof.json'
+
+      # Only reachable when the proof passed, because the step above throws.
+      # That ordering is the entire control: enforcement is not a checkbox
+      # someone ticks, it is something the evaluation has to earn.
+      - name: Promote to enforced
+        if: ${{ inputs.promote }}
+        env:
+          TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          TF_VAR_domain: ${{ vars.LAB_DOMAIN }}
+          TF_VAR_policy_state: enabled
+        run: terraform -chdir=infra apply -input=false -auto-approve
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: cutover-proof
+          path: cutover-proof.json
+          if-no-files-found: warn

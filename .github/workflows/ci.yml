@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  powershell:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -MinimumVersion 1.22.0 -Force
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module PSScriptAnalyzer -ErrorAction Stop
+
+          # The analyzer refuses to load on a PowerShell older than it supports,
+          # and a script that only inspects the result count then reports zero
+          # findings from a scan that never started. This lab was written after
+          # exactly that happened, so the load is asserted before anything is
+          # believed about the output.
+          if (-not (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {
+            throw 'PSScriptAnalyzer did not load. A scan that cannot run must fail, not pass quietly.'
+          }
+
+          $results = @()
+          foreach ($tree in 'module', 'scripts') {
+            $results += Invoke-ScriptAnalyzer -Path $tree -Recurse -ErrorAction Stop
+          }
+          # The test fixtures are named New-* because that is what they are.
+          # They build objects in memory and change nothing, so the
+          # state-changing rule is a false positive on this tree alone.
+          $results += Invoke-ScriptAnalyzer -Path tests -Recurse -ErrorAction Stop `
+            -ExcludeRule PSReviewUnusedParameter, PSUseShouldProcessForStateChangingFunctions
+
+          if ($results.Count) {
+            $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message |
+              Out-String -Width 200 | Write-Host
+            throw "PSScriptAnalyzer reported $($results.Count) issue(s)."
+          }
+          Write-Host 'PSScriptAnalyzer is clean.'
+
+      # Every judgement about whether a policy is safe is testable without a
+      # directory. If these ever need a tenant to run, that separation is gone.
+      - name: Test
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Validate the scenario matrix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $matrix = [System.IO.File]::ReadAllText('scenario-matrix.json') | ConvertFrom-Json
+          $scenarios = @($matrix.scenarios)
+          if (-not $scenarios.Count) { throw 'The scenario matrix is empty.' }
+
+          $missingWhy = @($scenarios | Where-Object { -not $_.why })
+          if ($missingWhy.Count) {
+            throw "$($missingWhy.Count) scenario(s) state no reason. A rule nobody can review is not a rule."
+          }
+
+          # A matrix that only asserts denials describes a tenant nobody can use,
+          # and one that only asserts grants proves nothing was configured.
+          $granted = @($scenarios | Where-Object { $_.expect -eq 'Granted' })
+          $refused = @($scenarios | Where-Object { $_.expect -in @('Blocked', 'MfaRequired', 'CompliantDeviceRequired') })
+          if (-not $granted.Count) { throw 'No scenario expects to succeed, so the matrix cannot show the tenant still works.' }
+          if (-not $refused.Count) { throw 'No scenario expects to be refused, so the matrix proves nothing about the policies.' }
+
+          # The recovery account has to be represented, or the central claim of
+          # this lab is untested.
+          $breakGlass = @($scenarios | Where-Object { $_.identity -eq 'breakGlass' })
+          if (-not $breakGlass.Count) { throw 'No scenario covers the break-glass account.' }
+          $refusedBreakGlass = @($breakGlass | Where-Object { $_.expect -ne 'Granted' })
+          if ($refusedBreakGlass.Count) {
+            throw 'A scenario expects the break-glass account to be refused. That account exists to never be refused.'
+          }
+
+          foreach ($scenario in $scenarios) {
+            if (-not $matrix.identities.($scenario.identity)) {
+              throw "Scenario '$($scenario.name)' names identity '$($scenario.identity)', which the matrix does not define."
+            }
+            if (-not $matrix.applications.($scenario.application)) {
+              throw "Scenario '$($scenario.name)' names application '$($scenario.application)', which the matrix does not define."
+            }
+          }
+
+          Write-Host "$($scenarios.Count) scenarios, $($refused.Count) refusals, $($granted.Count) grants, every one with a reason."
+          "### Scenario matrix"                                                     | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          ""                                                                        | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "**$($scenarios.Count)** scenarios across **$(($scenarios | ForEach-Object { $_.identity } | Sort-Object -Unique).Count)** identities, asserting **$($refused.Count)** refusals." |
+            Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-results
+          path: testResults.xml
+          if-no-files-found: warn
+
+  terraform:
+    name: Terraform format, validate, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform -chdir=infra init -backend=false -input=false
+          terraform -chdir=infra validate
+
+      - uses: terraform-linters/setup-tflint@v6
+
+      - name: Lint
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+  security:
+    name: Checkov policy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          config_file: .checkov.yaml

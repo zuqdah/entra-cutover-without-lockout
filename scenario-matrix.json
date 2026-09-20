@@ -1,0 +1,79 @@
+{
+  "$comment": "Every scenario states what should happen at sign-in and why. The proof run asks Entra what would actually happen and fails on any disagreement. A scenario with no 'why' is a rule nobody can review, so CI rejects the file if one is missing.",
+  "identities": {
+    "breakGlass": {
+      "displayName": "break-glass-01",
+      "note": "Holds standing Global Administrator, has no registered MFA method, and is excluded from every blocking policy by group membership. This is the account that gets the tenant back."
+    },
+    "admin": {
+      "displayName": "cutover-admin",
+      "note": "A working administrator. Privileged, but expected to meet every control."
+    },
+    "standardUser": {
+      "displayName": "cutover-user",
+      "note": "An ordinary synced user with no directory roles."
+    }
+  },
+  "applications": {
+    "azureManagement": "797f4846-ba00-4fd7-ba43-dac1f8f63013",
+    "office365": "00000003-0000-0ff1-ce00-000000000000"
+  },
+  "scenarios": [
+    {
+      "name": "break-glass reaches Azure management",
+      "identity": "breakGlass",
+      "application": "azureManagement",
+      "conditions": { "clientAppType": "browser", "devicePlatform": "windows", "country": "US" },
+      "expect": "Granted",
+      "why": "This is the whole point of the account. It has no MFA method and no managed device, so any control at all locks it out. If this scenario ever fails, the tenant has no recovery path and nothing else in this matrix matters."
+    },
+    {
+      "name": "break-glass reaches Azure management from an unusual country",
+      "identity": "breakGlass",
+      "application": "azureManagement",
+      "conditions": { "clientAppType": "browser", "devicePlatform": "windows", "country": "DE" },
+      "expect": "Granted",
+      "why": "An outage does not wait for the administrator to be at their desk. Location conditions must not apply to the recovery account."
+    },
+    {
+      "name": "administrator reaches Azure management",
+      "identity": "admin",
+      "application": "azureManagement",
+      "conditions": { "clientAppType": "browser", "devicePlatform": "windows", "country": "US" },
+      "expect": "MfaRequired",
+      "why": "Administrative access to the control plane is the highest-value session in the tenant and always warrants a second factor."
+    },
+    {
+      "name": "administrator on a legacy client",
+      "identity": "admin",
+      "application": "office365",
+      "conditions": { "clientAppType": "exchangeActiveSync", "devicePlatform": "windows", "country": "US" },
+      "expect": "Blocked",
+      "why": "Legacy authentication protocols cannot present a second factor, so they are the standing bypass around every MFA policy in the tenant."
+    },
+    {
+      "name": "standard user reaches Office 365",
+      "identity": "standardUser",
+      "application": "office365",
+      "conditions": { "clientAppType": "browser", "devicePlatform": "windows", "country": "US" },
+      "expect": "Granted",
+      "why": "The ordinary path has to keep working. A matrix that only proves things are blocked proves the tenant is unusable, not that it is secure."
+    },
+    {
+      "name": "standard user on a legacy client",
+      "identity": "standardUser",
+      "application": "office365",
+      "conditions": { "clientAppType": "exchangeActiveSync", "devicePlatform": "windows", "country": "US" },
+      "expect": "Blocked",
+      "why": "The legacy authentication block applies to everyone, not only to administrators. Scoping it to admins alone leaves the bypass open for the accounts most likely to be password-sprayed."
+    },
+    {
+      "name": "standard user reaches Azure management",
+      "identity": "standardUser",
+      "application": "azureManagement",
+      "conditions": { "clientAppType": "browser", "devicePlatform": "windows", "country": "US" },
+      "expect": "MfaRequired",
+      "why": "Reading the control plane is not harmless: it exposes the shape of the estate. Anyone reaching Azure management proves a second factor, role or no role."
+    }
+  ]
+}
