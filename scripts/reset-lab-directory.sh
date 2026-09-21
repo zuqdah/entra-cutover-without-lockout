@@ -25,6 +25,39 @@ PREFIX="${1:-cutover}"
 GRAPH="https://graph.microsoft.com/v1.0"
 removed=0
 
+# Dropping a role assignment is accepted immediately and takes a few seconds to
+# be reflected in the check that guards deleting the account. Deleting straight
+# afterwards gets Authorization_RequestDenied on an account that is, by then,
+# not actually privileged -- so the refusal is retried rather than treated as
+# final. Every other status is final on the first attempt, because retrying a
+# real permission problem just reports it more slowly.
+delete_with_retry() {
+  local url="$1"
+  local label="$2"
+  local attempt=0
+  local output
+
+  while : ; do
+    attempt=$((attempt + 1))
+    if output=$(az rest --method DELETE --url "$url" 2>&1); then
+      return 0
+    fi
+
+    if ! grep -q 'Authorization_RequestDenied' <<<"$output"; then
+      echo "  failed to remove ${label}: ${output}" >&2
+      return 1
+    fi
+
+    if [ "$attempt" -ge 6 ]; then
+      echo "  gave up on ${label} after ${attempt} attempts; still reported as privileged" >&2
+      return 1
+    fi
+
+    echo "  ${label} still reads as privileged, waiting for the role removal to land (attempt ${attempt})"
+    sleep 10
+  done
+}
+
 echo "Resetting objects named '${PREFIX}*'."
 
 # Principals first, so their role assignments can be found before the objects
@@ -53,7 +86,7 @@ for kind in users groups; do
 
   for id in $ids; do
     [ -z "$id" ] && continue
-    az rest --method DELETE --url "${GRAPH}/${kind}/${id}" >/dev/null
+    delete_with_retry "${GRAPH}/${kind}/${id}" "${kind}/${id}"
     echo "  removed ${kind}/${id}"
     removed=$((removed + 1))
   done
