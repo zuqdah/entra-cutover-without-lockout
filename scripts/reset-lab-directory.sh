@@ -105,10 +105,14 @@ for id in $policies; do
   removed=$((removed + 1))
 done
 
-# Users and groups are soft deleted and keep their userPrincipalName reserved
-# for 30 days, so leaving them in the recycle bin makes the next apply fail on a
-# name that nothing visible is using. Purging is part of the teardown, not an
-# extra.
+# Deleting a user or group only soft deletes it: the object sits in the
+# directory's recycle bin for 30 days and can be restored whole. It does not
+# block the name being reused -- successive runs of this lab recreated the same
+# userPrincipalNames without complaint -- so this is not about making the next
+# apply work. It is about what "torn down" means. An account that held Global
+# Administrator, restorable by anyone who can reach the bin, is not gone, and a
+# teardown that leaves one there while reporting success is the kind of claim
+# this lab exists to distrust.
 deleted=$(az rest --method GET \
   --url "${GRAPH}/directory/deletedItems/microsoft.graph.user?\$select=id,displayName" \
   --query "value[?starts_with(displayName,'${PREFIX}')].id" -o tsv 2>/dev/null || true)
