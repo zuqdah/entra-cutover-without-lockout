@@ -87,7 +87,9 @@ address between two records of the same person and will **never** auto-fix an
 different people; resolving it wrongly welds one person's mailbox onto another's
 account.
 
-## Two bugs this found in itself
+## What the runs actually taught
+
+Before a directory was involved, two bugs came out of the unit tests:
 
 **PowerShell unrolls a `HashSet` on the way out of a function.** `return $set`
 emits the set's *members* — nothing at all when it is empty, and a bare string
@@ -97,12 +99,58 @@ the comma operator; the same fix applied to arrays over-corrected and made every
 empty result look like one item, which flipped the false positive to a false
 negative in the other direction.
 
-**A check that could not run reported clean.** The analyzer step refused to load
-on an unsupported PowerShell version, both scans errored, and the script printed
+**A check that could not run reported clean.** The analyzer refused to load on
+an unsupported PowerShell version, both scans errored, and the script printed
 `clean` because it only inspected the result count. CI now asserts the analyzer
-actually loaded before believing anything about its output. This is the third
-time this shape of bug has appeared across this lab series, so it is worth
-stating as a rule: **a check that cannot run must fail, never pass quietly.**
+loaded before believing anything about its output.
+
+Then the live runs found things no fixture would have:
+
+**Naming an application in a policy needs a permission that using `All` does
+not.** Two of the three policies created and the third returned 403:
+`Application.Read.All scope is required to add/edit application condition`. A
+policy scoped to `["All"]` needs no application lookup; one that names
+`797f4846-…` needs Entra to resolve it.
+
+**`User.ReadWrite.All` cannot delete a user who holds a privileged directory
+role.** The break-glass accounts hold Global Administrator, so teardown failed
+with `Authorization_RequestDenied`. The common answer is to give the automation
+Global Administrator. This drops the role assignment first and then deletes an
+ordinary user — the same end state, without an identity holding standing Global
+Administrator in order to run a cleanup.
+
+**Soft deletion renames the account, and the rename is what frees the name.**
+A deleted user goes to the recycle bin with its `userPrincipalName` rewritten to
+prepend its object ID:
+
+```
+cutover-admin@lab  ->  72f13840ab56...cutover-admin@lab
+```
+
+That rename lands a beat after the `DELETE` returns `200`, so an apply starting
+immediately failed with *"Another object with the same value for property
+userPrincipalName already exists"* about an account that appeared in no list.
+Two wrong guesses preceded the right one — first that the bin reserves the name
+(it does not, it holds the rewritten one), then that purging was needed to free
+it (purging is asynchronous and made the race worse). The reset now waits on the
+rename itself.
+
+**The teardown's read-back earned its keep on the first real teardown.** The
+deletion step reported success and a Conditional Access policy was still listed
+afterwards. It had gone a moment later, so it was propagation rather than a
+failed delete — but a teardown that had trusted its own return codes would have
+reported a clean directory over a live policy. It now polls for three minutes
+and then fails, rather than retrying forever or treating a timeout as good
+enough.
+
+**The What If endpoint returns an occasional 500.** One run died on the second
+of seven calls; the same request replayed immediately succeeded, and seven
+sequential replays all succeeded. Transient statuses are retried and nothing
+else is, because retrying a 403 takes four times as long to report the same
+deterministic failure and hides which kind it was.
+
+The thread running through most of these: **an accepted call is not a completed
+one, and a check that cannot run must fail rather than pass quietly.**
 
 ## Running it
 
@@ -132,13 +180,64 @@ being clean.
 | | |
 |---|---|
 | Unit tests | 61, green, no directory required |
-| PSScriptAnalyzer | clean |
-| `terraform validate`, `tflint`, `checkov`, `actionlint` | clean |
-| Live proof run | **not yet run** — waiting on a lab tenant |
+| PSScriptAnalyzer, `terraform validate`, `tflint`, `checkov`, `actionlint`, `shellcheck` | clean |
+| Live proof run | **passed** against a real tenant, 7/7 scenarios, 0 lockouts |
+| Teardown | **verified** against the directory afterwards, 0 objects left |
+| Promotion to enforced | **not exercised** — see below |
 
-The logic, the policies and the workflows are complete and verified as far as
-they can be without a directory. The end-to-end run against a real tenant is the
-remaining step, and this section will say so plainly until it has happened.
+The proof run's own output:
+
+```
+ok   break-glass reaches Azure management                          Granted
+ok   break-glass reaches Azure management from an unusual country  Granted
+ok   administrator reaches Azure management                        MfaRequired
+ok   administrator on a legacy client                              Blocked
+ok   standard user reaches Office 365                              Granted
+ok   standard user on a legacy client                              Blocked
+ok   standard user reaches Azure management                        MfaRequired
+ok   every break-glass account can still reach a recovery surface
+```
+
+**Promotion has deliberately not been run.** The `promote` path is the one step
+whose failure mode is a locked tenant, and the accounts that would recover it
+hold passwords generated into ephemeral Terraform state — so in this lab there
+is no usable break-glass, which is precisely the situation the code refuses to
+declare safe. Saying that plainly is better than claiming an untested path
+works.
+
+## Permissions the automation holds
+
+Application permissions on Microsoft Graph, granted to a single app registration
+that authenticates by federated credential and holds no secret:
+
+| Permission | Why |
+|---|---|
+| `Policy.ReadWrite.ConditionalAccess` | Create and read the policies |
+| `Policy.Read.All` | Read tenant policy state |
+| `Application.Read.All` | Resolve application IDs named in policy conditions |
+| `User.ReadWrite.All`, `Group.ReadWrite.All` | Create and remove the lab identities |
+| `RoleManagement.ReadWrite.Directory` | Assign and remove directory roles |
+| `UserAuthenticationMethod.Read.All` | Read whether break-glass has a second factor registered |
+| `User.DeleteRestore.All` | Purge the recycle bin so teardown is complete |
+
+`RoleManagement.ReadWrite.Directory` is the sharp one: it can assign any
+directory role, Global Administrator included, which makes it a privilege
+escalation path in its own right. It is appropriate for a disposable lab tenant
+and is not something to hand out in a directory that matters.
+
+## On state
+
+There is no remote backend. The directory this runs against is disposable and
+emptied nightly, so the directory is the source of truth: a run starts by
+returning it to empty, and teardown deletes by name prefix rather than from
+state. That also catches objects a partially failed apply orphaned and objects
+created by hand in the portal, both of which a state-based destroy misses by
+definition — and in a fresh runner with no state, a `terraform destroy` finds
+nothing to do and reports success over a full directory.
+
+The tradeoff is real and worth naming: this is not how a durable environment
+should be managed, and for anything that outlives a night the state belongs in a
+remote backend with locking.
 
 ## What this does not do
 
