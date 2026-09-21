@@ -65,13 +65,51 @@ function Invoke-Graph {
         $arguments['Body'] = ($Body | ConvertTo-Json -Depth 12 -Compress)
     }
 
-    try {
-        return Invoke-RestMethod @arguments
-    }
-    catch {
-        $detail = $_.ErrorDetails.Message
-        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $_.Exception.Message }
-        throw "Graph $Method $Uri failed: $detail"
+    # The evaluate endpoint returns an occasional 500 on a run of sequential
+    # calls. It is not reproducible: the same request replayed immediately
+    # succeeds. So transient statuses are retried, and nothing else is --
+    # retrying a 403 or a malformed request just takes four times as long to
+    # report the same deterministic failure, and hides which kind it was.
+    $attempt = 0
+    $maxAttempts = 4
+
+    while ($true) {
+        $attempt++
+        try {
+            return Invoke-RestMethod @arguments
+        }
+        catch {
+            $status = 0
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+
+            $transient = ($status -eq 429 -or $status -ge 500)
+            if (-not $transient -or $attempt -ge $maxAttempts) {
+                $detail = $_.ErrorDetails.Message
+                if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $_.Exception.Message }
+                $tried = if ($attempt -gt 1) { " after $attempt attempts" } else { '' }
+                throw "Graph $Method $Uri failed$tried with status $status`: $detail"
+            }
+
+            # Honour Retry-After when the service sends one; it knows better
+            # than a fixed schedule does.
+            $wait = [Math]::Pow(2, $attempt)
+            try {
+                $retryAfter = $_.Exception.Response.Headers.RetryAfter
+                if ($retryAfter -and $retryAfter.Delta) { $wait = $retryAfter.Delta.TotalSeconds }
+            }
+            catch {
+                # The header shape varies across the exception types this can
+                # throw. Failing to read it is not worth failing the request
+                # over, so the backoff schedule stands and the reason is said
+                # out loud rather than swallowed.
+                Write-Information "  could not read Retry-After ($($_.Exception.GetType().Name)), using backoff of $wait s"
+            }
+
+            Write-Information "  transient $status on $Method $Uri, retrying in $wait s (attempt $attempt of $maxAttempts)"
+            Start-Sleep -Seconds $wait
+        }
     }
 }
 
