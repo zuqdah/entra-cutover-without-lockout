@@ -43,26 +43,46 @@ jobs:
       - name: Remove every object this lab creates
         run: ./scripts/reset-lab-directory.sh
 
+      # The step above reporting success is not the same as the directory being
+      # clean, so the state is read back from a separate set of calls. That
+      # matters: on the run this check was written for, the deletion reported
+      # success and a Conditional Access policy was still listed afterwards.
+      #
+      # Deletion is eventually consistent, so this polls rather than reading
+      # once -- but it is still a check that fails. Retrying forever, or
+      # treating a timeout as good enough, would turn it into the kind of
+      # reassurance that reports clean over a full directory.
       - name: Confirm the directory is clean
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $deadline = (Get-Date).AddMinutes(3)
+          $attempt = 0
 
-          $policies = az rest --method GET `
-            --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$select=id,displayName' |
-            ConvertFrom-Json
-          $left = @($policies.value | Where-Object { $_.displayName -like 'cutover *' })
+          while ($true) {
+            $attempt++
 
-          $users = az ad user list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json
-          $groups = az ad group list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json
+            $policies = az rest --method GET `
+              --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$select=id,displayName' |
+              ConvertFrom-Json
+            $left = @($policies.value | Where-Object { $_.displayName -like 'cutover*' })
 
-          Write-Host "policies left: $($left.Count), users left: $(@($users).Count), groups left: $(@($groups).Count)"
+            $users = @(az ad user list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json)
+            $groups = @(az ad group list --filter "startswith(displayName,'cutover-')" --query "[].displayName" -o json | ConvertFrom-Json)
 
-          if ($left.Count -or @($users).Count -or @($groups).Count) {
-            $left | ForEach-Object { Write-Host "  policy: $($_.displayName)" }
-            $users | ForEach-Object { Write-Host "  user: $_" }
-            $groups | ForEach-Object { Write-Host "  group: $_" }
-            throw 'The directory still holds objects this lab created.'
+            $total = $left.Count + $users.Count + $groups.Count
+            if ($total -eq 0) {
+              Write-Host "The directory is clean, confirmed on read $attempt."
+              break
+            }
+
+            if ((Get-Date) -ge $deadline) {
+              $left | ForEach-Object { Write-Host "  policy: $($_.displayName)" }
+              $users | ForEach-Object { Write-Host "  user: $_" }
+              $groups | ForEach-Object { Write-Host "  group: $_" }
+              throw "The directory still holds $total object(s) this lab created, three minutes after they were deleted."
+            }
+
+            Write-Host "still listed: $($left.Count) policy, $($users.Count) user(s), $($groups.Count) group(s) - deletion is eventually consistent, re-reading (attempt $attempt)"
+            Start-Sleep -Seconds 15
           }
-
-          Write-Host 'The directory is clean.'
