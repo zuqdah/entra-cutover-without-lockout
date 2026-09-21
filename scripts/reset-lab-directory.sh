@@ -105,46 +105,22 @@ for id in $policies; do
   removed=$((removed + 1))
 done
 
-# Deleting a user or group only soft deletes it: the object sits in the
-# directory's recycle bin for 30 days and can be restored whole. It does not
-# block the name being reused -- successive runs of this lab recreated the same
-# userPrincipalNames without complaint -- so this is not about making the next
-# apply work. It is about what "torn down" means. An account that held Global
-# Administrator, restorable by anyone who can reach the bin, is not gone, and a
-# teardown that leaves one there while reporting success is the kind of claim
-# this lab exists to distrust.
-deleted=$(az rest --method GET \
-  --url "${GRAPH}/directory/deletedItems/microsoft.graph.user?\$select=id,displayName" \
-  --query "value[?starts_with(displayName,'${PREFIX}')].id" -o tsv 2>/dev/null || true)
-
-for id in $deleted; do
-  [ -z "$id" ] && continue
-  az rest --method DELETE --url "${GRAPH}/directory/deletedItems/${id}" >/dev/null
-  echo "  purged deleted user/${id}"
-done
-
-deleted_groups=$(az rest --method GET \
-  --url "${GRAPH}/directory/deletedItems/microsoft.graph.group?\$select=id,displayName" \
-  --query "value[?starts_with(displayName,'${PREFIX}')].id" -o tsv 2>/dev/null || true)
-
-for id in $deleted_groups; do
-  [ -z "$id" ] && continue
-  az rest --method DELETE --url "${GRAPH}/directory/deletedItems/${id}" >/dev/null
-  echo "  purged deleted group/${id}"
-done
-
-# A DELETE being accepted is not the same as the object being gone. Purging is
-# processed asynchronously, and while it is in flight the userPrincipalName
-# stays claimed -- so an apply that starts the moment the last call returns 200
-# fails with "Another object with the same value for property
-# userPrincipalName already exists" about an account that no longer appears
-# anywhere. Soft deletion alone did not reserve the name in this tenant; the
-# purge is what briefly does.
+# A DELETE being accepted is not the same as the name being free, and the
+# reason is specific. Deleting a user soft deletes it, and on the way into the
+# recycle bin Entra rewrites its userPrincipalName to prepend the object ID:
 #
-# So the script does not finish on the strength of its own return codes. It
-# reads the directory back until the names are actually free, and fails if they
-# never become free rather than handing a racing apply to the next step.
-echo "Waiting for the directory to agree that the objects are gone."
+#   cutover-admin@lab      ->  72f13840...cutover-admin@lab
+#
+# That rename is what releases the original name, and it lands a beat after the
+# DELETE returns 200. An apply that starts immediately therefore fails with
+# "Another object with the same value for property userPrincipalName already
+# exists" about an account that no longer appears in any list -- which is a
+# genuinely baffling error to read.
+#
+# So this waits on the rename rather than on its own return codes. The count
+# that matters is objects still holding an un-rewritten name: an entry sitting
+# in the bin under its rewritten name blocks nothing.
+echo "Waiting for the deleted names to be released."
 
 for attempt in $(seq 1 30); do
   live_users=$(az rest --method GET \
@@ -153,20 +129,55 @@ for attempt in $(seq 1 30); do
   live_groups=$(az rest --method GET \
     --url "${GRAPH}/groups?\$select=id,displayName" \
     --query "length(value[?starts_with(displayName,'${PREFIX}')])" -o tsv)
-  bin_users=$(az rest --method GET \
-    --url "${GRAPH}/directory/deletedItems/microsoft.graph.user?\$select=id,displayName" \
-    --query "length(value[?starts_with(displayName,'${PREFIX}')])" -o tsv 2>/dev/null || echo 0)
 
-  total=$((live_users + live_groups + bin_users))
+  # Bin entries whose UPN still begins with the prefix have not been rewritten
+  # yet and are still holding the name.
+  unreleased=$(az rest --method GET \
+    --url "${GRAPH}/directory/deletedItems/microsoft.graph.user?\$select=id,userPrincipalName" \
+    --query "length(value[?starts_with(userPrincipalName,'${PREFIX}')])" -o tsv 2>/dev/null || echo 0)
+
+  total=$((live_users + live_groups + unreleased))
   if [ "$total" -eq 0 ]; then
-    echo "Removed ${removed} object(s); the lab directory is empty and the names are free."
-    exit 0
+    echo "  names released after ${attempt} check(s)."
+    break
   fi
 
-  echo "  still present: ${live_users} user(s), ${live_groups} group(s), ${bin_users} in the recycle bin (attempt ${attempt})"
+  if [ "$attempt" -eq 30 ]; then
+    echo "Objects named '${PREFIX}*' still hold their names after five minutes." >&2
+    echo "Applying now would fail on a name that is still claimed, so this stops here." >&2
+    exit 1
+  fi
+
+  echo "  still holding a name: ${live_users} user(s), ${live_groups} group(s), ${unreleased} awaiting rename (attempt ${attempt})"
   sleep 10
 done
 
-echo "The directory still reports objects named '${PREFIX}*' after five minutes." >&2
-echo "Applying now would fail on a name that is still claimed, so this stops here." >&2
-exit 1
+# Purging happens last, once the names are free, because the bin cannot be
+# queried for an object that has only just been deleted -- an earlier version of
+# this script purged before the deletions had landed there and so purged
+# nothing, silently.
+#
+# This is about what "torn down" means rather than about making the next apply
+# work. An account that held Global Administrator, restorable in full by anyone
+# who can reach the recycle bin, is not gone; a teardown that leaves one there
+# and reports success is the kind of claim this lab exists to distrust. It is
+# best effort, and says so out loud when it cannot finish, because an
+# unpurgeable leftover should not block a proof run that is otherwise fine.
+purged=0
+for type in user group; do
+  ids=$(az rest --method GET \
+    --url "${GRAPH}/directory/deletedItems/microsoft.graph.${type}?\$select=id,displayName" \
+    --query "value[?starts_with(displayName,'${PREFIX}')].id" -o tsv 2>/dev/null || true)
+
+  for id in $ids; do
+    [ -z "$id" ] && continue
+    if az rest --method DELETE --url "${GRAPH}/directory/deletedItems/${id}" >/dev/null 2>&1; then
+      echo "  purged deleted ${type}/${id}"
+      purged=$((purged + 1))
+    else
+      echo "  WARNING: could not purge deleted ${type}/${id}; it stays restorable until Entra expires it" >&2
+    fi
+  done
+done
+
+echo "Removed ${removed} live object(s), purged ${purged} from the recycle bin."
