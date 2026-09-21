@@ -43,6 +43,41 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
+      # This lab keeps no remote state, because the directory it runs against is
+      # disposable and is emptied nightly. That makes the directory itself the
+      # source of truth, so a run begins by putting it back to empty rather than
+      # by trusting a state file that did not survive the last runner. Without
+      # this, a partially failed apply leaves objects behind that no state file
+      # knows about, and every later run dies on "already exists".
+      - name: Reset the lab directory
+        run: |
+          set -euo pipefail
+
+          for kind in users groups; do
+            az rest --method GET \
+              --url "https://graph.microsoft.com/v1.0/$kind?\$select=id,displayName" \
+              --query "value[?starts_with(displayName,'cutover')].id" -o tsv |
+            while read -r id; do
+              [ -z "$id" ] && continue
+              az rest --method DELETE --url "https://graph.microsoft.com/v1.0/$kind/$id"
+              echo "removed $kind/$id"
+            done
+          done
+
+          # Single-quoted on purpose. $select is an OData parameter and has to
+          # reach Graph literally; letting the shell expand it sends an empty
+          # select and changes what comes back.
+          az rest --method GET \
+            --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$select=id,displayName' \
+            --query "value[?starts_with(displayName,'cutover')].id" -o tsv |
+          while read -r id; do
+            [ -z "$id" ] && continue
+            az rest --method DELETE --url "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/$id"
+            echo "removed policy/$id"
+          done
+
+          echo 'The lab directory is back to empty.'
+
       - name: Init
         run: terraform -chdir=infra init -input=false
 
