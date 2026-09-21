@@ -27,6 +27,8 @@ jobs:
           echo "Confirmation was '${{ inputs.confirm }}', expected 'destroy'."
           exit 1
 
+      - uses: actions/checkout@v7
+
       - name: Mask identifiers
         run: |
           echo "::add-mask::${{ secrets.AZURE_TENANT_ID }}"
@@ -38,47 +40,9 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
-      # Teardown deletes by name prefix rather than from Terraform state, and
-      # that is deliberate. This lab keeps no remote state, so a state-based
-      # destroy in a fresh runner would find nothing to do and report success
-      # over a directory that still holds every object. Deleting by prefix also
-      # catches anything created by hand in the portal, which a state-based
-      # destroy would leave behind by definition.
       - name: Remove every object this lab creates
-        run: |
-          set -euo pipefail
-          removed=0
+        run: ./scripts/reset-lab-directory.sh
 
-          for kind in users groups; do
-            while read -r id; do
-              [ -z "$id" ] && continue
-              az rest --method DELETE --url "https://graph.microsoft.com/v1.0/$kind/$id"
-              echo "removed $kind/$id"
-              removed=$((removed + 1))
-            done < <(az rest --method GET \
-              --url "https://graph.microsoft.com/v1.0/$kind?\$select=id,displayName" \
-              --query "value[?starts_with(displayName,'cutover')].id" -o tsv)
-          done
-
-          # The policies URL below is single-quoted on purpose. $select is an
-          # OData parameter and has to reach Graph literally; letting the shell
-          # expand it sends an empty select and changes what comes back.
-          while read -r id; do
-            [ -z "$id" ] && continue
-            az rest --method DELETE --url "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/$id"
-            echo "removed policy/$id"
-            removed=$((removed + 1))
-          done < <(az rest --method GET \
-            --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$select=id,displayName' \
-            --query "value[?starts_with(displayName,'cutover')].id" -o tsv)
-
-          echo "removed $removed object(s)."
-
-      # The deletion step above reporting success is not the same as the
-      # directory being clean: a DELETE can be accepted and still leave the
-      # object, and a Conditional Access policy left behind in a tenant is the
-      # kind of leftover that locks someone out months later. So the state is
-      # read back independently of the calls that changed it.
       - name: Confirm the directory is clean
         shell: pwsh
         run: |
