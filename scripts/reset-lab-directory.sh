@@ -133,4 +133,40 @@ for id in $deleted_groups; do
   echo "  purged deleted group/${id}"
 done
 
-echo "Removed ${removed} live object(s); the lab directory is back to empty."
+# A DELETE being accepted is not the same as the object being gone. Purging is
+# processed asynchronously, and while it is in flight the userPrincipalName
+# stays claimed -- so an apply that starts the moment the last call returns 200
+# fails with "Another object with the same value for property
+# userPrincipalName already exists" about an account that no longer appears
+# anywhere. Soft deletion alone did not reserve the name in this tenant; the
+# purge is what briefly does.
+#
+# So the script does not finish on the strength of its own return codes. It
+# reads the directory back until the names are actually free, and fails if they
+# never become free rather than handing a racing apply to the next step.
+echo "Waiting for the directory to agree that the objects are gone."
+
+for attempt in $(seq 1 30); do
+  live_users=$(az rest --method GET \
+    --url "${GRAPH}/users?\$select=id,displayName" \
+    --query "length(value[?starts_with(displayName,'${PREFIX}')])" -o tsv)
+  live_groups=$(az rest --method GET \
+    --url "${GRAPH}/groups?\$select=id,displayName" \
+    --query "length(value[?starts_with(displayName,'${PREFIX}')])" -o tsv)
+  bin_users=$(az rest --method GET \
+    --url "${GRAPH}/directory/deletedItems/microsoft.graph.user?\$select=id,displayName" \
+    --query "length(value[?starts_with(displayName,'${PREFIX}')])" -o tsv 2>/dev/null || echo 0)
+
+  total=$((live_users + live_groups + bin_users))
+  if [ "$total" -eq 0 ]; then
+    echo "Removed ${removed} object(s); the lab directory is empty and the names are free."
+    exit 0
+  fi
+
+  echo "  still present: ${live_users} user(s), ${live_groups} group(s), ${bin_users} in the recycle bin (attempt ${attempt})"
+  sleep 10
+done
+
+echo "The directory still reports objects named '${PREFIX}*' after five minutes." >&2
+echo "Applying now would fail on a name that is still claimed, so this stops here." >&2
+exit 1
