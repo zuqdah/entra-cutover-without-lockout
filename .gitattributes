@@ -1,0 +1,9 @@
+# Shell scripts must keep LF endings. A .sh checked out with CRLF fails on Linux
+# with a bad interpreter error naming a path that looks correct, which is a
+# genuinely confusing way to lose ten minutes.
+*.sh text eol=lf
+
+# Same reasoning for anything a Linux runner executes or parses.
+*.yml text eol=lf
+*.yaml text eol=lf
+*.tf text eol=lf
